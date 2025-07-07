@@ -1,0 +1,8 @@
+{
+  "name": "FinTra",
+  "description": "A sophisticated financial dashboard application to track accounts, expenses, and financial goals. Features AI-powered receipt scanning to automatically populate expense details.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "prompt": ""
+}

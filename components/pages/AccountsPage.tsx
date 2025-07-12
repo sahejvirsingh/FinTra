@@ -1,8 +1,4 @@
 
-
-
-
-
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Loader2, Plus, Pencil, Trash2, TrendingUp, TrendingDown, Wallet } from 'lucide-react';
 import { useUser } from '../../contexts/UserContext';
@@ -44,14 +40,15 @@ const AccountHealthBar = ({ balance, monthlyIncome, currency }: {
     );
 };
 
-const AccountsPage = () => {
+const AccountsPage = ({ refreshTrigger }: { refreshTrigger: number }) => {
     const { profile } = useUser();
-    const { currentWorkspace } = useWorkspace();
+    const { currentWorkspace, loading: workspaceLoading } = useWorkspace();
     
     const [accounts, setAccounts] = useState<Account[]>([]);
     const [recurringIncomes, setRecurringIncomes] = useState<RecurringIncome[]>([]);
     
     const [loading, setLoading] = useState(true);
+    const [isRefreshing, setIsRefreshing] = useState(false);
     const [deleteError, setDeleteError] = useState<string | null>(null);
 
     // Modal states
@@ -66,9 +63,31 @@ const AccountsPage = () => {
 
     const primaryCurrency = profile?.currency || 'USD';
 
-    const fetchData = useCallback(async () => {
+    const fetchData = useCallback(async (isRefresh: boolean = false) => {
         if (!profile || !currentWorkspace.id) return;
-        setLoading(true);
+        
+        const cacheKey = `fintra_accounts_data_${currentWorkspace.id}`;
+
+        if (isRefresh) {
+            setIsRefreshing(true);
+        } else {
+            try {
+                const cachedData = sessionStorage.getItem(cacheKey);
+                if (cachedData) {
+                    const parsed = JSON.parse(cachedData);
+                    setAccounts(parsed.accounts || []);
+                    setRecurringIncomes(parsed.recurringIncomes || []);
+                    setLoading(false);
+                } else {
+                    setLoading(true);
+                }
+            } catch (e) {
+                console.error('Failed to load accounts cache', e);
+                sessionStorage.removeItem(cacheKey);
+                setLoading(true);
+            }
+        }
+        
         setDeleteError(null);
 
         try {
@@ -83,21 +102,34 @@ const AccountsPage = () => {
             if (accountsError) throw new Error(`Accounts: ${accountsError.message}`);
             if (recurringIncomesError) throw new Error(`Recurring Incomes: ${recurringIncomesError.message}`);
 
-            setAccounts((accountsData as Account[]) || []);
-            setRecurringIncomes(recurringIncomesData || []);
+            const freshData = {
+                accounts: (accountsData as unknown as Account[]) || [],
+                recurringIncomes: (recurringIncomesData as unknown as RecurringIncome[]) || [],
+            };
 
+            setAccounts(freshData.accounts);
+            setRecurringIncomes(freshData.recurringIncomes);
+
+            sessionStorage.setItem(cacheKey, JSON.stringify(freshData));
         } catch (err) {
             console.error(err);
         } finally {
             setLoading(false);
+            setIsRefreshing(false);
         }
     }, [profile, currentWorkspace.id]);
 
     useEffect(() => {
-        if (currentWorkspace.id) {
-           fetchData();
+        if (currentWorkspace.id && profile && !workspaceLoading) {
+            fetchData(false);
         }
-    }, [fetchData, currentWorkspace.id]);
+    }, [profile, workspaceLoading, currentWorkspace.id, fetchData]);
+    
+    useEffect(() => {
+        if (refreshTrigger > 0 && currentWorkspace.id && profile && !workspaceLoading) {
+            fetchData(true);
+        }
+    }, [refreshTrigger, profile, workspaceLoading, currentWorkspace.id, fetchData]);
     
     const { totalAssets, totalLiabilities, netWorth, monthlyIncomePerAccount } = useMemo(() => {
         const assets = accounts.filter(acc => acc.type !== 'Credit Card' && acc.type !== 'Loan').reduce((sum, acc) => sum + acc.balance, 0);
@@ -121,9 +153,9 @@ const AccountsPage = () => {
     const handleAddAccount = useCallback(async (newAccountData: Omit<Account, 'id' | 'created_at' | 'user_id' | 'workspace_id'>) => {
         if(!profile || !currentWorkspace.id) throw new Error("User or workspace not found");
         const accountToInsert: Database['public']['Tables']['accounts']['Insert'] = { ...newAccountData, user_id: profile.id, workspace_id: currentWorkspace.id };
-        const { error } = await supabase.from('accounts').insert([accountToInsert] as any);
+        const { error } = await supabase.from('accounts').insert(accountToInsert);
         if (error) throw new Error(error.message);
-        await fetchData();
+        await fetchData(true);
         setIsAccountModalOpen(false);
     }, [profile, fetchData, currentWorkspace.id]);
 
@@ -141,7 +173,7 @@ const AccountsPage = () => {
             if(error) {
                 throw error;
             } else {
-                await fetchData();
+                await fetchData(true);
             }
         } catch(err) {
             setDeleteError(`Failed to delete account: ${(err as Error).message}`);
@@ -154,15 +186,15 @@ const AccountsPage = () => {
     const handleAddRecurringIncome = async (data: Omit<RecurringIncome, 'id'|'created_at'|'user_id' | 'workspace_id'>) => {
         if (!profile || !currentWorkspace.id) return;
         const incomeToInsert: Database['public']['Tables']['recurring_incomes']['Insert'] = { ...data, user_id: profile.id, workspace_id: currentWorkspace.id };
-        const { error } = await supabase.from('recurring_incomes').insert([incomeToInsert] as any);
+        const { error } = await supabase.from('recurring_incomes').insert(incomeToInsert);
         if (error) throw new Error(error.message);
-        fetchData();
+        fetchData(true);
         setIsRecurringIncomeModalOpen(false);
     }
     const handleUpdateRecurringIncome = async (id: string, data: Omit<RecurringIncome, 'id'|'created_at'|'user_id' | 'workspace_id'>) => {
         const updateData: Database['public']['Tables']['recurring_incomes']['Update'] = data;
-        await supabase.from('recurring_incomes').update(updateData as any).eq('id', id);
-        fetchData();
+        await supabase.from('recurring_incomes').update(updateData).eq('id', id);
+        fetchData(true);
         setIsRecurringIncomeModalOpen(false);
         setIncomeToEdit(null);
     }
@@ -170,7 +202,7 @@ const AccountsPage = () => {
         if(!incomeToDeleteId) return;
         setIsDeleting(true);
         await supabase.from('recurring_incomes').delete().eq('id', incomeToDeleteId);
-        fetchData();
+        fetchData(true);
         setIsDeleting(false);
         setIsConfirmDeleteIncomeOpen(false);
         setIncomeToDeleteId(null);

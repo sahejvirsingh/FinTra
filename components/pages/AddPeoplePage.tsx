@@ -48,8 +48,8 @@ const MemberActions = ({ member, onRoleChange, onRemove }: { member: Organizatio
 };
 
 
-const AddPeoplePage = () => {
-    const { members, addMember, updateMemberRole, removeMember, currentWorkspace } = useWorkspace();
+const AddPeoplePage = ({ refreshTrigger }: { refreshTrigger: number }) => {
+    const { members, addMember, updateMemberRole, removeMember, currentWorkspace, fetchMembers } = useWorkspace();
     const { profile } = useUser();
     const [email, setEmail] = useState('');
     const [isSubmitting, setIsSubmitting] = useState(false);
@@ -58,6 +58,13 @@ const AddPeoplePage = () => {
     // State for confirmation modals
     const [isConfirming, setIsConfirming] = useState(false);
     const [itemToConfirm, setItemToConfirm] = useState<{ action: 'role' | 'remove'; member: OrganizationMember; newRole?: 'admin' | 'member' } | null>(null);
+
+    useEffect(() => {
+        if (refreshTrigger > 0 && currentWorkspace.type === 'organization') {
+            fetchMembers();
+        }
+    }, [refreshTrigger, fetchMembers, currentWorkspace.type]);
+
 
     const handleAddMember = async (e: React.FormEvent) => {
         e.preventDefault();

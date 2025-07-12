@@ -1,16 +1,15 @@
 
-
 import React, { useState, useCallback, useRef, useEffect, useMemo } from 'react';
 import { X, Upload, Plus, Trash2, Loader2 } from 'lucide-react';
-import { Expense, ExpenseItem, ExpenseCategories, Account, SupportedCurrencies, RecurringIncome } from '../../types';
+import { Expense, ExpenseItem, ExpenseCategories, Account, SupportedCurrencies, RecurringIncome, NewExpenseItem } from '../../types';
 import { extractDetailsFromReceipt } from '../../services/geminiService';
 import CustomDropdown from '../shared/CustomDropdown';
 import { useUser } from '../../contexts/UserContext';
 import { useWorkspace } from '../../contexts/WorkspaceContext';
 import { formatCurrency } from '../../utils/currency';
 
-export type NewExpenseData = Omit<Expense, 'id' | 'created_at' | 'expense_items' | 'user_id' | 'workspace_id'> & {
-  items: Omit<ExpenseItem, 'id'>[];
+export type NewExpenseData = Omit<Expense, 'id' | 'created_at' | 'expense_items' | 'user_id' | 'workspace_id' | 'verified' | 'verified_at' | 'verified_by' | 'goal_payment_id' | 'emi_payment_id'> & {
+  items: NewExpenseItem[];
 };
 
 interface AddExpenseModalProps {
@@ -33,7 +32,7 @@ const AddExpenseModal = ({ onClose, onAddExpense, onUpdateExpense, expenseToEdit
   const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
   const [time, setTime] = useState('');
   const [description, setDescription] = useState('');
-  const [items, setItems] = useState<Omit<ExpenseItem, 'id'>[]>([]);
+  const [items, setItems] = useState<NewExpenseItem[]>([]);
   const [accountId, setAccountId] = useState<string>('');
   
   const [isAiProcessing, setIsAiProcessing] = useState(false);
@@ -56,7 +55,7 @@ const AddExpenseModal = ({ onClose, onAddExpense, onUpdateExpense, expenseToEdit
       setDate(expenseToEdit.date.split('T')[0]);
       setTime(expenseToEdit.time || '');
       setDescription(expenseToEdit.description || '');
-      setItems(expenseToEdit.expense_items?.map(({id, expense_id, created_at, ...item}) => item) || []);
+      setItems(expenseToEdit.expense_items?.map(({name, price, quantity}) => ({name, price, quantity})) || []);
       setAccountId(expenseToEdit.account_id || '');
       
       const isStandardCategory = ExpenseCategories.includes(expenseToEdit.category);
@@ -82,7 +81,7 @@ const AddExpenseModal = ({ onClose, onAddExpense, onUpdateExpense, expenseToEdit
     setItems([...items, { name: '', price: 0, quantity: 1 }]);
   };
 
-  const handleItemChange = (index: number, field: keyof Omit<ExpenseItem, 'id'>, value: string | number) => {
+  const handleItemChange = (index: number, field: keyof NewExpenseItem, value: string | number) => {
     setItems(prevItems =>
       prevItems.map((item, i) =>
         i === index ? { ...item, [field]: value } : item
@@ -109,8 +108,8 @@ const AddExpenseModal = ({ onClose, onAddExpense, onUpdateExpense, expenseToEdit
       amount: parseFloat(amount),
       category: finalCategory,
       date,
-      time,
-      description,
+      time: time || null,
+      description: description || null,
       items,
       account_id: accountId,
     };

@@ -1,0 +1,755 @@
+-- =================================================================
+-- FinTra - Complete Database Schema & Setup Script (v7 - JWT Policies)
+-- =================================================================
+-- This script is idempotent. It can be run multiple times without error.
+-- It will drop all existing objects and recreate them from scratch.
+-- This version modifies RLS policies and helper functions to use auth.jwt()
+-- instead of auth.uid() for fetching the user's ID.
+--
+-- Execution Order:
+-- 1. Drop existing objects (views, functions, tables, types).
+-- 2. Create custom enum types.
+-- 3. Create table schemas.
+-- 4. Create trigger functions for automation.
+-- 5. Create helper functions for RLS and RPCs.
+-- 6. Create RPC functions for application business logic.
+-- 7. Apply triggers to tables.
+-- 8. Enable Row-Level Security (RLS) and define policies.
+-- 9. Grant permissions to roles.
+-- =================================================================
+
+-- 1. DROP EXISTING OBJECTS
+-- Drop functions with CASCADE to remove dependent policies.
+DO $$
+DECLARE
+    func_record RECORD;
+BEGIN
+    FOR func_record IN (SELECT proname, proargtypes FROM pg_proc WHERE pronamespace = 'public'::regnamespace)
+    LOOP
+        IF oidvectortypes(func_record.proargtypes) <> '' THEN
+             EXECUTE 'DROP FUNCTION IF EXISTS public.' || quote_ident(func_record.proname) || '(' || oidvectortypes(func_record.proargtypes) || ') CASCADE;';
+        ELSE
+             EXECUTE 'DROP FUNCTION IF EXISTS public.' || quote_ident(func_record.proname) || '() CASCADE;';
+        END IF;
+    END LOOP;
+END;
+$$;
+-- Drop tables with CASCADE to remove foreign key constraints.
+DO $$
+DECLARE
+    table_record RECORD;
+BEGIN
+    FOR table_record IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public')
+    LOOP
+        EXECUTE 'DROP TABLE IF EXISTS public.' || quote_ident(table_record.tablename) || ' CASCADE;';
+    END LOOP;
+END;
+$$;
+-- Drop custom types.
+DROP TYPE IF EXISTS public.workspace_type_enum CASCADE;
+DROP TYPE IF EXISTS public.workspace_member_role_enum CASCADE;
+DROP TYPE IF EXISTS public.goal_status_enum CASCADE;
+DROP TYPE IF EXISTS public.payment_type_enum CASCADE;
+
+
+-- 2. CREATE CUSTOM ENUM TYPES
+CREATE TYPE public.workspace_type_enum AS ENUM ('personal', 'organization');
+CREATE TYPE public.workspace_member_role_enum AS ENUM ('admin', 'member');
+CREATE TYPE public.goal_status_enum AS ENUM ('Pending', 'In-progress', 'Completed');
+CREATE TYPE public.payment_type_enum AS ENUM ('One-Time', 'SIP');
+
+
+-- 3. CREATE TABLE SCHEMAS
+-- Users table to store public profile information.
+-- id is now TEXT, with auth_id linking to auth.users.
+CREATE TABLE public.users (
+    id text PRIMARY KEY,
+    auth_id uuid NOT NULL UNIQUE REFERENCES auth.users(id) ON DELETE CASCADE,
+    full_name text,
+    currency text NOT NULL DEFAULT 'USD',
+    secondary_currency text,
+    auto_transfer_savings boolean NOT NULL DEFAULT false,
+    default_expense_account_id uuid,
+    updated_at timestamp with time zone DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- Workspaces table.
+CREATE TABLE public.workspaces (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name text NOT NULL,
+    type public.workspace_type_enum NOT NULL,
+    owner_id text NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    is_initial boolean NOT NULL DEFAULT false,
+    created_at timestamp with time zone DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- Junction table for workspace members.
+CREATE TABLE public.workspace_members (
+    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    user_id text NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    role public.workspace_member_role_enum NOT NULL DEFAULT 'member',
+    created_at timestamp with time zone DEFAULT timezone('utc'::text, now()) NOT NULL,
+    PRIMARY KEY (workspace_id, user_id)
+);
+
+-- Accounts table.
+CREATE TABLE public.accounts (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name text NOT NULL,
+    type text NOT NULL,
+    balance numeric(15, 2) NOT NULL DEFAULT 0.00,
+    icon_name text NOT NULL DEFAULT 'Briefcase',
+    user_id text NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    created_at timestamp with time zone DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+ALTER TABLE public.users ADD CONSTRAINT users_default_expense_account_id_fkey FOREIGN KEY (default_expense_account_id) REFERENCES public.accounts(id) ON DELETE SET NULL;
+
+-- Junction table for sharing accounts between workspaces.
+CREATE TABLE public.account_workspaces (
+    account_id uuid NOT NULL REFERENCES public.accounts(id) ON DELETE CASCADE,
+    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    created_at timestamp with time zone DEFAULT timezone('utc'::text, now()) NOT NULL,
+    PRIMARY KEY (account_id, workspace_id)
+);
+
+-- Expenses table.
+CREATE TABLE public.expenses (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    title text NOT NULL,
+    amount numeric(15, 2) NOT NULL,
+    category text NOT NULL,
+    date date NOT NULL,
+    time time without time zone,
+    description text,
+    account_id uuid REFERENCES public.accounts(id) ON DELETE SET NULL,
+    user_id text NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    verified boolean,
+    verified_at timestamp with time zone,
+    verified_by text REFERENCES public.users(id) ON DELETE SET NULL,
+    goal_payment_id uuid, -- Filled by trigger/rpc
+    emi_payment_id uuid, -- Filled by trigger/rpc
+    created_at timestamp with time zone DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- Expense items table.
+CREATE TABLE public.expense_items (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    expense_id uuid NOT NULL REFERENCES public.expenses(id) ON DELETE CASCADE,
+    name text NOT NULL,
+    price numeric(15, 2) NOT NULL,
+    quantity integer NOT NULL DEFAULT 1,
+    user_id text NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    created_at timestamp with time zone DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- Financial Goals table.
+CREATE TABLE public.goals (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    title text NOT NULL,
+    description text,
+    target_amount numeric(15, 2) NOT NULL,
+    current_amount numeric(15, 2) NOT NULL DEFAULT 0.00,
+    target_date date NOT NULL,
+    status public.goal_status_enum NOT NULL DEFAULT 'In-progress',
+    icon_name text NOT NULL DEFAULT 'Target',
+    user_id text NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    created_at timestamp with time zone DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- Goal Payments table.
+CREATE TABLE public.goal_payments (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    goal_id uuid NOT NULL REFERENCES public.goals(id) ON DELETE CASCADE,
+    account_id uuid NOT NULL REFERENCES public.accounts(id) ON DELETE CASCADE,
+    amount numeric(15, 2) NOT NULL,
+    payment_date date NOT NULL,
+    payment_type public.payment_type_enum NOT NULL,
+    related_expense_id uuid, -- Must be populated after expense insert
+    user_id text NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    created_at timestamp with time zone DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+ALTER TABLE public.expenses ADD CONSTRAINT expenses_goal_payment_id_fkey FOREIGN KEY (goal_payment_id) REFERENCES public.goal_payments(id) ON DELETE SET NULL;
+
+-- EMIs table.
+CREATE TABLE public.emis (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name text NOT NULL,
+    total_amount numeric(15, 2) NOT NULL,
+    monthly_payment numeric(15, 2) NOT NULL,
+    due_date_of_month integer NOT NULL CHECK (due_date_of_month BETWEEN 1 AND 31),
+    start_date date NOT NULL,
+    end_date date NOT NULL,
+    user_id text NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    created_at timestamp with time zone DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- EMI Payments table.
+CREATE TABLE public.emi_payments (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    emi_id uuid NOT NULL REFERENCES public.emis(id) ON DELETE CASCADE,
+    account_id uuid NOT NULL REFERENCES public.accounts(id) ON DELETE CASCADE,
+    amount numeric(15, 2) NOT NULL,
+    payment_date date NOT NULL,
+    payment_type public.payment_type_enum NOT NULL,
+    related_expense_id uuid,
+    user_id text NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    created_at timestamp with time zone DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+ALTER TABLE public.expenses ADD CONSTRAINT expenses_emi_payment_id_fkey FOREIGN KEY (emi_payment_id) REFERENCES public.emi_payments(id) ON DELETE SET NULL;
+
+-- Top-ups (Income) table.
+CREATE TABLE public.topups (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name text NOT NULL,
+    amount numeric(15, 2) NOT NULL,
+    description text,
+    account_id uuid NOT NULL REFERENCES public.accounts(id) ON DELETE CASCADE,
+    topup_time timestamp with time zone NOT NULL,
+    user_id text NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    created_at timestamp with time zone DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- Recurring Incomes table.
+CREATE TABLE public.recurring_incomes (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name text NOT NULL,
+    amount numeric(15, 2) NOT NULL,
+    day_of_month integer NOT NULL CHECK (day_of_month BETWEEN 1 AND 31),
+    account_id uuid NOT NULL REFERENCES public.accounts(id) ON DELETE CASCADE,
+    is_active boolean NOT NULL DEFAULT true,
+    user_id text NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    created_at timestamp with time zone DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- Monthly Budgets table.
+CREATE TABLE public.monthly_budgets (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id text NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+    workspace_id uuid NOT NULL REFERENCES public.workspaces(id) ON DELETE CASCADE,
+    category text NOT NULL,
+    amount numeric(15, 2) NOT NULL,
+    year integer NOT NULL,
+    month integer NOT NULL CHECK (month BETWEEN 1 AND 12),
+    created_at timestamp with time zone DEFAULT timezone('utc'::text, now()) NOT NULL,
+    UNIQUE (user_id, workspace_id, year, month, category)
+);
+
+
+-- 4. TRIGGER FUNCTIONS
+-- Function to create a user profile, initial workspace, and default account on new user sign-up.
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_workspace_id uuid;
+  v_account_id uuid;
+BEGIN
+  -- Create a public user profile, using the auth UUID as a text ID and also storing the UUID in auth_id.
+  INSERT INTO public.users (id, auth_id, full_name, currency)
+  VALUES (new.id::text, new.id, new.raw_user_meta_data->>'full_name', 'USD');
+
+  -- Create an initial personal workspace for the user
+  INSERT INTO public.workspaces (name, type, owner_id, is_initial)
+  VALUES ((new.raw_user_meta_data->>'full_name') || '''s Workspace', 'personal', new.id::text, true)
+  RETURNING id INTO v_workspace_id;
+
+  -- Add the user as an admin member of their new workspace
+  INSERT INTO public.workspace_members (workspace_id, user_id, role)
+  VALUES (v_workspace_id, new.id::text, 'admin');
+
+  -- Create a default "Cash" account for the user in their new workspace
+  INSERT INTO public.accounts (name, type, balance, icon_name, user_id, workspace_id)
+  VALUES ('Cash', 'Checking', 0.00, 'Wallet', new.id::text, v_workspace_id)
+  RETURNING id INTO v_account_id;
+
+  -- Set this new account as the default for expenses
+  UPDATE public.users SET default_expense_account_id = v_account_id WHERE id = new.id::text;
+  
+  RETURN new;
+END;
+$$;
+
+
+-- 5. HELPER FUNCTIONS
+-- Checks if the currently authenticated user is a member of a given workspace using the JWT.
+CREATE OR REPLACE FUNCTION public.is_member_of(p_workspace_id uuid)
+RETURNS boolean
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM workspace_members
+    WHERE workspace_id = p_workspace_id AND user_id = (auth.jwt() ->> 'sub')
+  );
+$$;
+
+-- Checks if the currently authenticated user is an admin of a given workspace using the JWT.
+CREATE OR REPLACE FUNCTION public.is_admin_of(p_workspace_id uuid)
+RETURNS boolean
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM workspace_members
+    WHERE workspace_id = p_workspace_id AND user_id = (auth.jwt() ->> 'sub') AND role = 'admin'
+  );
+$$;
+
+-- 6. RPC FUNCTIONS
+-- Create a new workspace
+CREATE OR REPLACE FUNCTION public.create_workspace(p_name text, p_type text)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_user_text_id text := (auth.jwt() ->> 'sub');
+  v_workspace_id uuid;
+  v_initial_exists boolean;
+BEGIN
+  -- Ensure a user can only have one initial personal workspace
+  IF p_type = 'personal' THEN
+    SELECT EXISTS(SELECT 1 FROM workspaces WHERE owner_id = v_user_text_id AND is_initial = TRUE) INTO v_initial_exists;
+    IF v_initial_exists THEN
+       INSERT INTO workspaces (name, type, owner_id, is_initial) VALUES (p_name, p_type::public.workspace_type_enum, v_user_text_id, FALSE) RETURNING id INTO v_workspace_id;
+    ELSE
+       INSERT INTO workspaces (name, type, owner_id, is_initial) VALUES (p_name, p_type::public.workspace_type_enum, v_user_text_id, TRUE) RETURNING id INTO v_workspace_id;
+    END IF;
+  ELSE
+     INSERT INTO workspaces (name, type, owner_id, is_initial) VALUES (p_name, p_type::public.workspace_type_enum, v_user_text_id, FALSE) RETURNING id INTO v_workspace_id;
+  END IF;
+
+  INSERT INTO workspace_members (workspace_id, user_id, role) VALUES (v_workspace_id, v_user_text_id, 'admin');
+  RETURN v_workspace_id;
+END;
+$$;
+
+-- Delete a workspace (with protection for last personal workspace)
+CREATE OR REPLACE FUNCTION public.delete_workspace(p_workspace_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    personal_workspace_count integer;
+    is_personal_to_delete boolean;
+    v_user_text_id text := (auth.jwt() ->> 'sub');
+BEGIN
+    -- First, check if user is admin of the workspace they want to delete
+    IF NOT is_admin_of(p_workspace_id) THEN
+        RAISE EXCEPTION 'You do not have permission to delete this workspace.';
+    END IF;
+
+    -- Check if it's a personal workspace owned by the current user
+    SELECT type = 'personal' INTO is_personal_to_delete FROM public.workspaces WHERE id = p_workspace_id AND owner_id = v_user_text_id;
+
+    -- If it is, check if it's their last one
+    IF is_personal_to_delete THEN
+        SELECT count(*) INTO personal_workspace_count FROM public.workspaces WHERE owner_id = v_user_text_id AND type = 'personal';
+        IF personal_workspace_count <= 1 THEN
+            RAISE EXCEPTION 'You cannot delete your last personal workspace.';
+        END IF;
+    END IF;
+
+    -- If all checks pass, delete it.
+    DELETE FROM public.workspaces WHERE id = p_workspace_id;
+END;
+$$;
+
+-- Get all workspaces for the current user
+CREATE OR REPLACE FUNCTION public.get_workspaces_for_user()
+RETURNS TABLE (
+  id uuid, name text, type public.workspace_type_enum, owner_id text, role public.workspace_member_role_enum, is_initial boolean
+)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT w.id, w.name, w.type, w.owner_id, wm.role, w.is_initial
+  FROM workspaces w
+  JOIN workspace_members wm ON w.id = wm.workspace_id
+  WHERE wm.user_id = (auth.jwt() ->> 'sub');
+$$;
+
+-- Add a member to a workspace
+CREATE OR REPLACE FUNCTION public.add_workspace_member(p_workspace_id uuid, p_user_email text, p_role public.workspace_member_role_enum)
+RETURNS json
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_user_text_id text;
+BEGIN
+  IF NOT is_admin_of(p_workspace_id) THEN
+    RAISE EXCEPTION 'Only admins can add members.';
+  END IF;
+
+  SELECT id::text INTO v_user_text_id FROM auth.users WHERE email = p_user_email;
+  IF v_user_text_id IS NULL THEN
+    RAISE EXCEPTION 'User with this email does not exist.';
+  END IF;
+  
+  INSERT INTO public.workspace_members (workspace_id, user_id, role)
+  VALUES (p_workspace_id, v_user_text_id, p_role)
+  ON CONFLICT (workspace_id, user_id) DO NOTHING;
+  
+  RETURN json_build_object('status', 'success', 'user_id', v_user_text_id);
+END;
+$$;
+
+-- Update a member's role
+CREATE OR REPLACE FUNCTION public.update_workspace_member_role(p_workspace_id uuid, p_user_id text, p_new_role public.workspace_member_role_enum)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF NOT is_admin_of(p_workspace_id) THEN
+    RAISE EXCEPTION 'Only admins can change roles.';
+  END IF;
+  UPDATE public.workspace_members SET role = p_new_role WHERE workspace_id = p_workspace_id AND user_id = p_user_id;
+END;
+$$;
+
+-- Remove a member from a workspace
+CREATE OR REPLACE FUNCTION public.delete_workspace_member(p_workspace_id uuid, p_user_id text)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    target_user_is_owner boolean;
+BEGIN
+  IF NOT is_admin_of(p_workspace_id) THEN
+    RAISE EXCEPTION 'Only admins can remove members.';
+  END IF;
+
+  SELECT (owner_id = p_user_id) INTO target_user_is_owner FROM public.workspaces WHERE id = p_workspace_id;
+  IF target_user_is_owner THEN
+      RAISE EXCEPTION 'Cannot remove the workspace owner.';
+  END IF;
+
+  DELETE FROM public.workspace_members WHERE workspace_id = p_workspace_id AND user_id = p_user_id;
+END;
+$$;
+
+-- Get accounts, including shared ones
+CREATE OR REPLACE FUNCTION public.get_accounts_for_workspace(p_workspace_id uuid)
+RETURNS SETOF public.accounts
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  SELECT a.* FROM public.accounts a WHERE a.workspace_id = p_workspace_id
+  UNION
+  SELECT a.* FROM public.accounts a JOIN public.account_workspaces aw ON a.id = aw.account_id WHERE aw.workspace_id = p_workspace_id;
+$$;
+
+-- Delete an account and all its related data
+CREATE OR REPLACE FUNCTION public.delete_account(p_account_id uuid)
+RETURNS VOID LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+BEGIN
+    IF EXISTS(SELECT 1 FROM accounts WHERE id = p_account_id AND user_id = (auth.jwt() ->> 'sub')) THEN
+        DELETE FROM expenses WHERE account_id = p_account_id;
+        DELETE FROM topups WHERE account_id = p_account_id;
+        DELETE FROM recurring_incomes WHERE account_id = p_account_id;
+        -- Add other dependencies here if needed
+        DELETE FROM accounts WHERE id = p_account_id;
+    ELSE
+        RAISE EXCEPTION 'Permission denied to delete account';
+    END IF;
+END;
+$$;
+
+
+-- Get predicted spending for a workspace
+CREATE OR REPLACE FUNCTION public.get_predicted_spending(p_workspace_id uuid)
+RETURNS TABLE (category text, predicted_amount real)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+  WITH monthly_totals AS (
+    SELECT date_trunc('month', e.date) AS expense_month, e.category, SUM(e.amount) AS total_spent
+    FROM public.expenses AS e
+    WHERE e.workspace_id = p_workspace_id
+      AND e.date >= date_trunc('month', now() - interval '3 months')
+      AND e.date < date_trunc('month', now())
+    GROUP BY expense_month, e.category
+  )
+  SELECT mt.category, (avg(mt.total_spent))::real AS predicted_amount
+  FROM monthly_totals AS mt
+  GROUP BY mt.category
+  ORDER BY predicted_amount DESC;
+$$;
+
+-- Get net worth history (Corrected Version)
+CREATE OR REPLACE FUNCTION public.get_net_worth_history(p_workspace_id uuid, p_start_date text, p_end_date text, p_time_interval text)
+RETURNS TABLE(snapshot_date text, net_worth real)
+LANGUAGE sql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+    WITH date_series AS (
+        SELECT generate_series(
+            p_start_date::date,
+            p_end_date::date,
+            ('1 ' || p_time_interval)::interval
+        )::date AS "snapshot_date"
+    ),
+    workspace_accounts AS (
+        SELECT * FROM get_accounts_for_workspace(p_workspace_id)
+    ),
+    current_net_worth AS (
+        SELECT COALESCE(SUM(balance), 0.0) AS value
+        FROM workspace_accounts
+    ),
+    transactions AS (
+        SELECT e.date, e.amount AS value FROM expenses e WHERE e.account_id IN (SELECT id FROM workspace_accounts)
+        UNION ALL
+        SELECT t.topup_time::date, -t.amount AS value FROM topups t WHERE t.account_id IN (SELECT id FROM workspace_accounts)
+    )
+    SELECT
+        to_char(ds.snapshot_date, 'YYYY-MM-DD') AS snapshot_date,
+        (
+            (SELECT value FROM current_net_worth)
+            +
+            (SELECT COALESCE(SUM(t.value), 0) FROM transactions t WHERE t.date > ds.snapshot_date AND t.date <= p_end_date::date)
+        )::real AS net_worth
+    FROM date_series ds
+    ORDER BY ds.snapshot_date;
+$$;
+
+-- Share an account with other workspaces
+CREATE OR REPLACE FUNCTION public.share_account_with_workspaces(p_account_id uuid, p_workspace_ids uuid[])
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_workspace_id uuid;
+BEGIN
+  -- Validate ownership
+  IF NOT EXISTS (SELECT 1 FROM public.accounts WHERE id = p_account_id AND user_id = (auth.jwt() ->> 'sub')) THEN
+      RAISE EXCEPTION 'Only the account owner can share it.';
+  END IF;
+
+  -- Clear existing shares for this account
+  DELETE FROM public.account_workspaces WHERE account_id = p_account_id;
+  
+  -- Insert new shares
+  FOREACH v_workspace_id IN ARRAY p_workspace_ids
+  LOOP
+      INSERT INTO public.account_workspaces (account_id, workspace_id) VALUES (p_account_id, v_workspace_id);
+  END LOOP;
+END;
+$$;
+
+-- Add expense and update balances
+CREATE OR REPLACE FUNCTION public.add_expense(p_user_id text, p_account_id uuid, p_title text, p_amount numeric, p_category text, p_date date, p_time time, p_description text, p_items json, p_workspace_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_expense_id uuid;
+  item json;
+BEGIN
+  INSERT INTO public.expenses (title, amount, category, date, time, description, account_id, user_id, workspace_id)
+  VALUES (p_title, p_amount, p_category, p_date, p_time, p_description, p_account_id, p_user_id, p_workspace_id)
+  RETURNING id INTO v_expense_id;
+
+  IF p_account_id IS NOT NULL THEN
+    UPDATE public.accounts SET balance = balance - p_amount WHERE id = p_account_id;
+  END IF;
+
+  IF json_array_length(p_items) > 0 THEN
+    FOR item IN SELECT * FROM json_array_elements(p_items)
+    LOOP
+      INSERT INTO public.expense_items (expense_id, name, price, quantity, user_id)
+      VALUES (v_expense_id, item->>'name', (item->>'price')::numeric, (item->>'quantity')::integer, p_user_id);
+    END LOOP;
+  END IF;
+END;
+$$;
+
+-- Add, Update, and Delete Top-ups (Income) with balance adjustments
+CREATE OR REPLACE FUNCTION public.add_topup(p_account_id uuid, p_amount numeric, p_description text, p_name text, p_topup_time timestamp with time zone, p_user_id text, p_workspace_id uuid)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+BEGIN
+  IF NOT is_member_of(p_workspace_id) THEN
+    RAISE EXCEPTION 'Permission denied';
+  END IF;
+  INSERT INTO public.topups(account_id, amount, description, name, topup_time, user_id, workspace_id)
+  VALUES (p_account_id, p_amount, p_description, p_name, p_topup_time, p_user_id, p_workspace_id);
+  UPDATE public.accounts SET balance = balance + p_amount WHERE id = p_account_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.update_topup(p_topup_id uuid, p_new_account_id uuid, p_new_amount numeric, p_new_name text, p_new_description text, p_new_topup_time timestamp with time zone)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+  v_old_topup public.topups%ROWTYPE;
+  v_balance_diff numeric;
+BEGIN
+  SELECT * INTO v_old_topup FROM public.topups WHERE id = p_topup_id;
+  IF v_old_topup IS NULL THEN
+    RAISE EXCEPTION 'Top-up not found.';
+  END IF;
+  IF NOT is_member_of(v_old_topup.workspace_id) THEN
+    RAISE EXCEPTION 'Permission denied';
+  END IF;
+  IF v_old_topup.account_id = p_new_account_id THEN
+    v_balance_diff := p_new_amount - v_old_topup.amount;
+    UPDATE public.accounts SET balance = balance + v_balance_diff WHERE id = p_new_account_id;
+  ELSE
+    UPDATE public.accounts SET balance = balance - v_old_topup.amount WHERE id = v_old_topup.account_id;
+    UPDATE public.accounts SET balance = balance + p_new_amount WHERE id = p_new_account_id;
+  END IF;
+  UPDATE public.topups
+  SET account_id = p_new_account_id, amount = p_new_amount, name = p_new_name, description = p_new_description, topup_time = p_new_topup_time
+  WHERE id = p_topup_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.delete_topup(p_topup_id uuid)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+DECLARE
+  v_topup public.topups%ROWTYPE;
+BEGIN
+  SELECT * INTO v_topup FROM public.topups WHERE id = p_topup_id;
+  IF v_topup IS NULL THEN
+    RAISE EXCEPTION 'Top-up not found.';
+  END IF;
+  IF NOT is_member_of(v_topup.workspace_id) THEN
+    RAISE EXCEPTION 'Permission denied';
+  END IF;
+  UPDATE public.accounts SET balance = balance - v_topup.amount WHERE id = v_topup.account_id;
+  DELETE FROM public.topups WHERE id = p_topup_id;
+END;
+$$;
+
+-- 7. APPLY TRIGGERS
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE PROCEDURE public.handle_new_user();
+
+
+-- 8. ENABLE RLS AND DEFINE POLICIES
+-- Enable RLS on all tables
+ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.workspaces ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.workspace_members ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.accounts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.account_workspaces ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.expenses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.expense_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.topups ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.goals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.goal_payments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.emis ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.emi_payments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.recurring_incomes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.monthly_budgets ENABLE ROW LEVEL SECURITY;
+
+-- Drop existing policies to ensure this script is re-runnable
+DROP POLICY IF EXISTS "Users can manage their own profile" ON public.users;
+DROP POLICY IF EXISTS "Users can view workspaces they belong to" ON public.workspaces;
+DROP POLICY IF EXISTS "Workspace owners can manage their workspace" ON public.workspaces;
+DROP POLICY IF EXISTS "Members can view other members in their workspace" ON public.workspace_members;
+DROP POLICY IF EXISTS "Admins can manage members" ON public.workspace_members;
+DROP POLICY IF EXISTS "Members can manage native accounts" ON public.accounts;
+DROP POLICY IF EXISTS "Members can view shared accounts" ON public.accounts;
+DROP POLICY IF EXISTS "Account owners can manage sharing settings" ON public.account_workspaces;
+DROP POLICY IF EXISTS "Members can manage items in their workspaces" ON public.expenses;
+DROP POLICY IF EXISTS "Members can manage items in their workspaces" ON public.expense_items;
+DROP POLICY IF EXISTS "Members can manage items in their workspaces" ON public.topups;
+DROP POLICY IF EXISTS "Members can manage items in their workspaces" ON public.goals;
+DROP POLICY IF EXISTS "Members can manage items in their workspaces" ON public.goal_payments;
+DROP POLICY IF EXISTS "Members can manage items in their workspaces" ON public.emis;
+DROP POLICY IF EXISTS "Members can manage items in their workspaces" ON public.emi_payments;
+DROP POLICY IF EXISTS "Members can manage items in their workspaces" ON public.recurring_incomes;
+DROP POLICY IF EXISTS "Members can manage items in their workspaces" ON public.monthly_budgets;
+
+-- Create Policies
+-- Users: Can only manage their own user row by checking against the JWT's sub claim.
+CREATE POLICY "Users can manage their own profile" ON public.users FOR ALL
+  USING (auth_id = (auth.jwt() ->> 'sub')::uuid) WITH CHECK (auth_id = (auth.jwt() ->> 'sub')::uuid);
+
+-- Workspaces: Can view if a member, can manage if owner.
+CREATE POLICY "Users can view workspaces they belong to" ON public.workspaces FOR SELECT
+  USING (is_member_of(id));
+CREATE POLICY "Workspace owners can manage their workspace" ON public.workspaces FOR ALL
+  USING (owner_id = (auth.jwt() ->> 'sub')) WITH CHECK (owner_id = (auth.jwt() ->> 'sub'));
+
+-- Workspace Members: NON-RECURSIVE policies
+CREATE POLICY "Members can view other members in their workspace" ON public.workspace_members FOR SELECT
+  USING ( EXISTS (
+    SELECT 1 FROM public.workspace_members self_check
+    WHERE self_check.workspace_id = public.workspace_members.workspace_id AND self_check.user_id = (auth.jwt() ->> 'sub')
+  ));
+CREATE POLICY "Admins can manage members" ON public.workspace_members FOR ALL
+  USING ( EXISTS (
+    SELECT 1 FROM public.workspace_members self_check
+    WHERE self_check.workspace_id = public.workspace_members.workspace_id AND self_check.user_id = (auth.jwt() ->> 'sub') AND self_check.role = 'admin'
+  ));
+
+-- Accounts: Policies for native and shared access (NON-RECURSIVE)
+CREATE POLICY "Members can manage native accounts" ON public.accounts FOR ALL
+  USING (is_member_of(workspace_id))
+  WITH CHECK (is_member_of(workspace_id));
+
+CREATE POLICY "Members can view shared accounts" ON public.accounts FOR SELECT
+  USING (EXISTS (
+      SELECT 1 FROM public.account_workspaces aw
+      JOIN public.workspace_members wm ON aw.workspace_id = wm.workspace_id
+      WHERE aw.account_id = public.accounts.id AND wm.user_id = (auth.jwt() ->> 'sub')
+  ));
+
+-- Account Workspaces: Only account owner can manage sharing.
+CREATE POLICY "Account owners can manage sharing settings" ON public.account_workspaces FOR ALL
+  USING ( (SELECT user_id FROM public.accounts WHERE id = public.account_workspaces.account_id) = (auth.jwt() ->> 'sub') )
+  WITH CHECK ( (SELECT user_id FROM public.accounts WHERE id = public.account_workspaces.account_id) = (auth.jwt() ->> 'sub') );
+  
+-- Generic Workspace Data Policies (these inherit the auth.jwt() change via the is_member_of helper function)
+CREATE POLICY "Members can manage items in their workspaces" ON public.expenses FOR ALL USING (is_member_of(workspace_id)) WITH CHECK (is_member_of(workspace_id));
+CREATE POLICY "Members can manage items in their workspaces" ON public.expense_items FOR ALL USING (EXISTS (SELECT 1 FROM expenses WHERE id = expense_id AND is_member_of(workspace_id))) WITH CHECK (EXISTS (SELECT 1 FROM expenses WHERE id = expense_id AND is_member_of(workspace_id)));
+CREATE POLICY "Members can manage items in their workspaces" ON public.topups FOR ALL USING (is_member_of(workspace_id)) WITH CHECK (is_member_of(workspace_id));
+CREATE POLICY "Members can manage items in their workspaces" ON public.goals FOR ALL USING (is_member_of(workspace_id)) WITH CHECK (is_member_of(workspace_id));
+CREATE POLICY "Members can manage items in their workspaces" ON public.goal_payments FOR ALL USING (EXISTS (SELECT 1 FROM goals WHERE id = goal_id AND is_member_of(workspace_id))) WITH CHECK (EXISTS (SELECT 1 FROM goals WHERE id = goal_id AND is_member_of(workspace_id)));
+CREATE POLICY "Members can manage items in their workspaces" ON public.emis FOR ALL USING (is_member_of(workspace_id)) WITH CHECK (is_member_of(workspace_id));
+CREATE POLICY "Members can manage items in their workspaces" ON public.emi_payments FOR ALL USING (EXISTS (SELECT 1 FROM emis WHERE id = emi_id AND is_member_of(workspace_id))) WITH CHECK (EXISTS (SELECT 1 FROM emis WHERE id = emi_id AND is_member_of(workspace_id)));
+CREATE POLICY "Members can manage items in their workspaces" ON public.recurring_incomes FOR ALL USING (is_member_of(workspace_id)) WITH CHECK (is_member_of(workspace_id));
+CREATE POLICY "Members can manage items in their workspaces" ON public.monthly_budgets FOR ALL USING (is_member_of(workspace_id)) WITH CHECK (is_member_of(workspace_id));
+
+
+-- 9. GRANT PERMISSIONS
+GRANT usage ON SCHEMA public TO anon, authenticated;
+GRANT all ON ALL TABLES IN SCHEMA public TO anon, authenticated;
+GRANT all ON ALL FUNCTIONS IN SCHEMA public TO anon, authenticated;
+GRANT all ON ALL SEQUENCES IN SCHEMA public TO anon, authenticated;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon, authenticated;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO anon, authenticated;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO anon, authenticated;

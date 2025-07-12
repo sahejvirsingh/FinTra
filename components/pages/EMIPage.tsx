@@ -1,7 +1,4 @@
 
-
-
-
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Loader2, Plus } from 'lucide-react';
 import { supabase } from '../../lib/supabaseClient';
@@ -17,14 +14,14 @@ import WarningBanner from '../shared/WarningBanner';
 
 type EmiStatus = 'Active' | 'Completed';
 
-const EMIPage = () => {
+const EMIPage = ({ refreshTrigger }: { refreshTrigger: number }) => {
     const [emis, setEmis] = useState<EMI[]>([]);
     const [accounts, setAccounts] = useState<Account[]>([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [deleteError, setDeleteError] = useState<string | null>(null);
     const { profile } = useUser();
-    const { currentWorkspace } = useWorkspace();
+    const { currentWorkspace, loading: workspaceLoading } = useWorkspace();
 
 
     // Modal state
@@ -39,20 +36,54 @@ const EMIPage = () => {
     const [emiForPayment, setEmiForPayment] = useState<string | null>(null);
 
 
-    const fetchPageData = useCallback(async () => {
+    const fetchPageData = useCallback(async (isRefresh: boolean = false) => {
         if (!profile || !currentWorkspace.id) return;
-        setLoading(true);
+        
+        const cacheKey = `fintra_emi_data_${currentWorkspace.id}`;
+
+        if (!isRefresh) {
+            try {
+                const cachedData = sessionStorage.getItem(cacheKey);
+                if (cachedData) {
+                    const parsed = JSON.parse(cachedData);
+                    setEmis(parsed.emis || []);
+                    setAccounts(parsed.accounts || []);
+                    setLoading(false);
+                } else {
+                    setLoading(true);
+                }
+            } catch (e) {
+                console.error("Failed to load EMI cache", e);
+                sessionStorage.removeItem(cacheKey);
+                setLoading(true);
+            }
+        } else {
+            setLoading(true);
+        }
+
         setError(null);
         setDeleteError(null);
         try {
-            const { data: emisData, error: emisError } = await supabase.from('emis').select('*, emi_payments(*)').eq('workspace_id', currentWorkspace.id).order('due_date_of_month');
+            const emisPromise = supabase.from('emis').select('*, emi_payments(*)').eq('workspace_id', currentWorkspace.id).order('due_date_of_month');
+            const accountsPromise = supabase.rpc('get_accounts_for_workspace', { p_workspace_id: currentWorkspace.id });
+            
+            const [
+                { data: emisData, error: emisError },
+                { data: accountsData, error: accountsError }
+            ] = await Promise.all([emisPromise, accountsPromise]);
+
             if (emisError) throw new Error(`EMIs: ${emisError.message}`);
-            setEmis((emisData as EMI[]) || []);
-
-            const { data: accountsData, error: accountsError } = await supabase.rpc('get_accounts_for_workspace', { p_workspace_id: currentWorkspace.id });
             if (accountsError) throw new Error(`Accounts: ${accountsError.message}`);
-            setAccounts((accountsData as Account[]) || []);
 
+            const freshData = {
+                emis: (emisData as unknown as EMI[]) || [],
+                accounts: (accountsData as unknown as Account[]) || [],
+            };
+            
+            setEmis(freshData.emis);
+            setAccounts(freshData.accounts);
+
+            sessionStorage.setItem(cacheKey, JSON.stringify(freshData));
         } catch (err) {
             const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
             console.error("Failed to fetch EMI page data:", errorMessage);
@@ -63,10 +94,16 @@ const EMIPage = () => {
     }, [profile, currentWorkspace.id]);
 
     useEffect(() => {
-        if (currentWorkspace.id) {
-           fetchPageData();
+        if (currentWorkspace.id && profile && !workspaceLoading) {
+           fetchPageData(false);
         }
-    }, [fetchPageData, currentWorkspace.id]);
+    }, [profile, workspaceLoading, currentWorkspace.id, fetchPageData]);
+    
+    useEffect(() => {
+        if (refreshTrigger > 0 && currentWorkspace.id && profile && !workspaceLoading) {
+           fetchPageData(true);
+        }
+    }, [refreshTrigger, profile, workspaceLoading, currentWorkspace.id, fetchPageData]);
     
     const categorizedEmis = useMemo(() => {
         const board: { [key in EmiStatus]: EMI[] } = { 'Active': [], 'Completed': [] };
@@ -97,7 +134,7 @@ const EMIPage = () => {
         
         const { error } = await supabase.from('emis').insert([emiToInsert] as any);
         if (error) throw new Error(error.message);
-        await fetchPageData();
+        await fetchPageData(true);
         setIsEmiModalOpen(false);
     };
 
@@ -113,7 +150,7 @@ const EMIPage = () => {
         try {
             const { error } = await supabase.rpc('delete_emi', { p_emi_id: emiToDeleteId });
             if (error) throw error;
-            await fetchPageData();
+            await fetchPageData(true);
         } catch(err) {
             setDeleteError(`Error deleting EMI: ${(err as Error).message}`);
         } finally {
@@ -147,7 +184,7 @@ const EMIPage = () => {
         try {
             const { error } = await supabase.rpc('delete_emi_payment', { p_payment_id: paymentToDeleteId });
             if (error) throw error;
-            await fetchPageData();
+            await fetchPageData(true);
         } catch (err) {
             setDeleteError(`Failed to delete payment: ${(err as Error).message}`);
         } finally {
@@ -181,7 +218,7 @@ const EMIPage = () => {
                     p_user_id: profile.id
                 });
             }
-            await fetchPageData();
+            await fetchPageData(true);
             setIsPaymentModalOpen(false);
             setEmiForPayment(null);
             setPaymentToEdit(null);

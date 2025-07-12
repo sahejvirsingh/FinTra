@@ -1,12 +1,9 @@
 
-
-
-
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Loader2, Search, ArrowDownCircle, ArrowUpCircle, Target, CalendarClock, Filter, Package, X, ArrowUpDown, Check } from 'lucide-react';
 import { supabase } from '../../lib/supabaseClient';
 import { useUser } from '../../contexts/UserContext';
-import { Expense, TopUp, Account, ExpenseItem, RecurringIncome } from '../../types';
+import { Expense, TopUp, Account, ExpenseItem, RecurringIncome, AggregatedItem } from '../../types';
 import { formatCurrency } from '../../utils/currency';
 import AddExpenseModal, { NewExpenseData } from '../modals/AddExpenseModal';
 import AddTopUpModal from '../modals/AddTopUpModal';
@@ -29,16 +26,6 @@ type UnifiedTransaction = {
     original: Expense | TopUp;
 };
 
-export type AggregatedItem = {
-  name: string;
-  totalQuantity: number;
-  totalSpent: number;
-  occurrences: (ExpenseItem & {
-    expenseTitle: string;
-    expenseDate: string;
-    expenseId: string;
-  })[];
-};
 
 type TransactionSortOption = 'date-desc' | 'date-asc' | 'amount-desc' | 'amount-asc';
 type ItemSortOption = 'spent-desc' | 'spent-asc' | 'quantity-desc' | 'quantity-asc' | 'alpha-asc' | 'alpha-desc';
@@ -59,7 +46,7 @@ const itemSortOptions: { value: ItemSortOption; label: string }[] = [
     { value: 'alpha-desc', label: 'Alphabetical (Z-A)' },
 ];
 
-const TransactionsPage = () => {
+const TransactionsPage = ({ refreshTrigger }: { refreshTrigger: number }) => {
     const [expenses, setExpenses] = useState<Expense[]>([]);
     const [topups, setTopups] = useState<TopUp[]>([]);
     const [accounts, setAccounts] = useState<Account[]>([]);
@@ -68,7 +55,7 @@ const TransactionsPage = () => {
     const [error, setError] = useState<string | null>(null);
     const [searchTerm, setSearchTerm] = useState('');
     const { profile } = useUser();
-    const { currentWorkspace } = useWorkspace();
+    const { currentWorkspace, loading: workspaceLoading } = useWorkspace();
 
     // UI State
     const [viewMode, setViewMode] = useState<'transactions' | 'items'>('transactions');
@@ -108,27 +95,66 @@ const TransactionsPage = () => {
     useClickOutside(sortRef, () => setIsSortOpen(false));
 
 
-    const fetchData = useCallback(async () => {
+    const fetchData = useCallback(async (isRefresh: boolean = false) => {
         if (!profile || !currentWorkspace.id) return;
-        setLoading(true);
+        
+        const cacheKey = `fintra_transactions_data_${currentWorkspace.id}`;
+
+        if (!isRefresh) {
+            try {
+                const cachedData = sessionStorage.getItem(cacheKey);
+                if (cachedData) {
+                    const parsed = JSON.parse(cachedData);
+                    setExpenses(parsed.expenses || []);
+                    setTopups(parsed.topups || []);
+                    setAccounts(parsed.accounts || []);
+                    setRecurringIncomes(parsed.recurringIncomes || []);
+                    setLoading(false);
+                } else {
+                    setLoading(true);
+                }
+            } catch (e) {
+                console.error('Failed to load transactions cache', e);
+                sessionStorage.removeItem(cacheKey);
+                setLoading(true);
+            }
+        } else {
+            // For manual refresh, we can just let the loading spinner show
+            setLoading(true);
+        }
+        
         setError(null);
         try {
-            const { data: expensesData, error: expensesError } = await supabase.from('expenses').select('*, expense_items(*)').eq('workspace_id', currentWorkspace.id);
+            const expensesPromise = supabase.from('expenses').select('*, expense_items(*)').eq('workspace_id', currentWorkspace.id);
+            const topupsPromise = supabase.from('topups').select('*').eq('workspace_id', currentWorkspace.id);
+            const recurringPromise = supabase.from('recurring_incomes').select('*').eq('workspace_id', currentWorkspace.id);
+            const accountsPromise = supabase.rpc('get_accounts_for_workspace', { p_workspace_id: currentWorkspace.id });
+
+            const [
+                { data: expensesData, error: expensesError },
+                { data: topupsData, error: topupsError },
+                { data: recurringData, error: recurringError },
+                { data: accountsData, error: accountsError }
+            ] = await Promise.all([expensesPromise, topupsPromise, recurringPromise, accountsPromise]);
+
             if (expensesError) throw new Error(`Expenses: ${expensesError.message}`);
-            setExpenses((expensesData as Expense[]) || []);
-
-            const { data: topupsData, error: topupsError } = await supabase.from('topups').select('*').eq('workspace_id', currentWorkspace.id);
             if (topupsError) throw new Error(`Topups: ${topupsError.message}`);
-            setTopups(topupsData || []);
-            
-            const { data: recurringData, error: recurringError } = await supabase.from('recurring_incomes').select('*').eq('workspace_id', currentWorkspace.id);
             if (recurringError) throw new Error(`Recurring Incomes: ${recurringError.message}`);
-            setRecurringIncomes(recurringData || []);
-
-            const { data: accountsData, error: accountsError } = await supabase.rpc('get_accounts_for_workspace', { p_workspace_id: currentWorkspace.id });
             if (accountsError) throw new Error(`Accounts: ${accountsError.message}`);
-            setAccounts((accountsData as Account[]) || []);
 
+            const freshData = {
+                expenses: (expensesData as unknown as Expense[]) || [],
+                topups: (topupsData as unknown as TopUp[]) || [],
+                recurringIncomes: (recurringData as unknown as RecurringIncome[]) || [],
+                accounts: (accountsData as unknown as Account[]) || [],
+            };
+
+            setExpenses(freshData.expenses);
+            setTopups(freshData.topups);
+            setRecurringIncomes(freshData.recurringIncomes);
+            setAccounts(freshData.accounts);
+            
+            sessionStorage.setItem(cacheKey, JSON.stringify(freshData));
         } catch (err) {
             setError(err instanceof Error ? err.message : 'An unknown error occurred.');
             console.error(err);
@@ -138,10 +164,16 @@ const TransactionsPage = () => {
     }, [profile, currentWorkspace.id]);
 
     useEffect(() => {
-        if (currentWorkspace.id) {
-           fetchData();
+        if (currentWorkspace.id && profile && !workspaceLoading) {
+            fetchData(false);
         }
-    }, [fetchData, currentWorkspace.id]);
+    }, [profile, workspaceLoading, currentWorkspace.id, fetchData]);
+
+    useEffect(() => {
+        if (refreshTrigger > 0 && currentWorkspace.id && profile && !workspaceLoading) {
+            fetchData(true);
+        }
+    }, [refreshTrigger, profile, workspaceLoading, currentWorkspace.id, fetchData]);
     
     const handleUpdateExpense = async (expenseId: string, expenseData: NewExpenseData) => {
        await supabase.rpc('update_expense', {
@@ -154,18 +186,24 @@ const TransactionsPage = () => {
             p_new_date: expenseData.date,
             p_new_time: expenseData.time || null,
             p_new_description: expenseData.description,
-            p_new_items: expenseData.items,
+            p_new_items: expenseData.items as any,
         });
-       await fetchData();
+       await fetchData(true);
        setIsExpenseModalOpen(false);
        setEditingItem(null);
     };
     
     const handleUpdateTopUp = async (id: string, data: Omit<TopUp, 'id'|'created_at'|'user_id'|'workspace_id'>) => {
-        const updateData: Database['public']['Tables']['topups']['Update'] = data;
-        const { error } = await supabase.from('topups').update(updateData as any).eq('id', id);
+        const { error } = await supabase.rpc('update_topup', {
+            p_topup_id: id,
+            p_new_account_id: data.account_id,
+            p_new_amount: data.amount,
+            p_new_name: data.name,
+            p_new_description: data.description || null,
+            p_new_topup_time: data.topup_time
+        });
         if (error) throw new Error(error.message);
-        await fetchData();
+        await fetchData(true);
         setIsTopUpModalOpen(false);
         setEditingItem(null);
     };
@@ -178,7 +216,7 @@ const TransactionsPage = () => {
         } else if (deletingItem.type === 'topup') {
             await supabase.rpc('delete_topup', { p_topup_id: deletingItem.id });
         }
-        await fetchData();
+        await fetchData(true);
         setIsSubmitting(false);
         setIsConfirmOpen(false);
         setDeletingItem(null);
@@ -218,8 +256,8 @@ const TransactionsPage = () => {
             transactionItems = transactionItems.filter(t => new Date(t.date) >= startDate);
         }
         
-        // Filter by search term
-        if (searchTerm) {
+        // Filter by search term - only for transaction view
+        if (searchTerm && viewMode === 'transactions') {
             const lowerSearch = searchTerm.toLowerCase();
             transactionItems = transactionItems.filter(t => {
                 const standardMatch = t.title.toLowerCase().includes(lowerSearch) || 
@@ -241,7 +279,7 @@ const TransactionsPage = () => {
             filteredTransactions: transactionItems,
             filteredExpenses: fExpenses,
         };
-    }, [allTransactions, searchTerm, activeFilters]);
+    }, [allTransactions, searchTerm, activeFilters, viewMode]);
 
     const sortedTransactions = useMemo(() => {
         const items = [...filteredTransactions];
@@ -289,6 +327,12 @@ const TransactionsPage = () => {
         });
         
         let sorted = Array.from(itemsMap.values());
+
+        // Further filter by search term if in items view
+        if (searchTerm && viewMode === 'items') {
+            const lowerSearch = searchTerm.toLowerCase();
+            sorted = sorted.filter(item => item.name.toLowerCase().includes(lowerSearch));
+        }
         
         sorted.sort((a, b) => {
              switch (sortBy as ItemSortOption) {
@@ -303,8 +347,15 @@ const TransactionsPage = () => {
         });
 
         return sorted;
-    }, [filteredExpenses, sortBy]);
+    }, [filteredExpenses, sortBy, searchTerm, viewMode]);
 
+    const handleViewItemHistory = useCallback((item: ExpenseItem) => {
+        const itemToView = sortedItems.find(agg => agg.name.toLowerCase() === item.name.toLowerCase());
+        if (itemToView) {
+            setViewingExpense(null);
+            setSelectedItem(itemToView);
+        }
+    }, [sortedItems]);
 
     const handleEditRequest = (item: UnifiedTransaction) => {
         setViewingExpense(null); setEditingItem(item);
@@ -367,11 +418,11 @@ const TransactionsPage = () => {
       )
     }
 
-    const SortButton = ({label, value}: {label: string, value: string}) => {
+    const SortButton = ({label, value}: {label: string, value: TransactionSortOption | ItemSortOption}) => {
         const isActive = sortBy === value;
         return (
           <button 
-            onClick={() => { setSortBy(value as any); setIsSortOpen(false); }}
+            onClick={() => { setSortBy(value); setIsSortOpen(false); }}
             className={`px-3 py-1.5 text-sm rounded-md w-full text-left flex items-center justify-between ${isActive ? 'bg-indigo-600 text-white font-semibold' : 'hover:bg-gray-100 dark:hover:bg-gray-700'}`}
           >
             {label}
@@ -515,6 +566,7 @@ const TransactionsPage = () => {
                 onClose={() => setViewingExpense(null)}
                 onEdit={handleEditExpense}
                 onDelete={handleDeleteExpense}
+                onViewItemHistory={handleViewItemHistory}
             />}
             {selectedItem && <ItemDetailModal
                 item={selectedItem}

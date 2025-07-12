@@ -1,7 +1,4 @@
 
-
-
-
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Loader2, Plus } from 'lucide-react';
 import { supabase } from '../../lib/supabaseClient';
@@ -15,14 +12,14 @@ import AddGoalPaymentModal from '../modals/AddGoalPaymentModal';
 import { Database } from '../../lib/database.types';
 import WarningBanner from '../shared/WarningBanner';
 
-const FinancialGoalsPage = () => {
+const FinancialGoalsPage = ({ refreshTrigger }: { refreshTrigger: number }) => {
     const [goals, setGoals] = useState<Goal[]>([]);
     const [accounts, setAccounts] = useState<Account[]>([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [deleteError, setDeleteError] = useState<string | null>(null);
     const { profile } = useUser();
-    const { currentWorkspace } = useWorkspace();
+    const { currentWorkspace, loading: workspaceLoading } = useWorkspace();
 
     // Modals state
     const [isGoalModalOpen, setIsGoalModalOpen] = useState(false);
@@ -36,21 +33,55 @@ const FinancialGoalsPage = () => {
     const [paymentToEdit, setPaymentToEdit] = useState<GoalPayment | null>(null);
     const [goalForPayment, setGoalForPayment] = useState<string | null>(null);
 
-    const fetchPageData = useCallback(async () => {
+    const fetchPageData = useCallback(async (isRefresh: boolean = false) => {
         if (!profile || !currentWorkspace.id) return;
-        setLoading(true);
+        
+        const cacheKey = `fintra_goals_data_${currentWorkspace.id}`;
+        
+        if (!isRefresh) {
+            try {
+                const cachedData = sessionStorage.getItem(cacheKey);
+                if (cachedData) {
+                    const parsed = JSON.parse(cachedData);
+                    setGoals(parsed.goals || []);
+                    setAccounts(parsed.accounts || []);
+                    setLoading(false);
+                } else {
+                    setLoading(true);
+                }
+            } catch (e) {
+                console.error("Failed to load goals cache", e);
+                sessionStorage.removeItem(cacheKey);
+                setLoading(true);
+            }
+        } else {
+            setLoading(true);
+        }
+
         setError(null);
         setDeleteError(null);
         
         try {
-            const { data: goalsData, error: goalsError } = await supabase.from('goals').select('*, goal_payments(*)').eq('workspace_id', currentWorkspace.id).order('created_at', { ascending: false });
+            const goalsPromise = supabase.from('goals').select('*, goal_payments(*)').eq('workspace_id', currentWorkspace.id).order('created_at', { ascending: false });
+            const accountsPromise = supabase.rpc('get_accounts_for_workspace', { p_workspace_id: currentWorkspace.id });
+
+            const [
+                { data: goalsData, error: goalsError },
+                { data: accountsData, error: accountsError }
+            ] = await Promise.all([goalsPromise, accountsPromise]);
+
             if (goalsError) throw new Error(`Goals: ${goalsError.message}`);
-            setGoals((goalsData as Goal[]) || []);
-
-            const { data: accountsData, error: accountsError } = await supabase.rpc('get_accounts_for_workspace', { p_workspace_id: currentWorkspace.id });
             if (accountsError) throw new Error(`Accounts: ${accountsError.message}`);
-            setAccounts((accountsData as Account[]) || []);
+            
+            const freshData = {
+                goals: (goalsData as unknown as Goal[]) || [],
+                accounts: (accountsData as unknown as Account[]) || [],
+            };
 
+            setGoals(freshData.goals);
+            setAccounts(freshData.accounts);
+
+            sessionStorage.setItem(cacheKey, JSON.stringify(freshData));
         } catch (err) {
             setError(err instanceof Error ? err.message : 'An unknown error occurred.');
         } finally {
@@ -59,10 +90,17 @@ const FinancialGoalsPage = () => {
     }, [profile, currentWorkspace.id]);
 
     useEffect(() => {
-        if (currentWorkspace.id) {
-            fetchPageData();
+        if (currentWorkspace.id && profile && !workspaceLoading) {
+            fetchPageData(false);
         }
-    }, [fetchPageData, currentWorkspace.id]);
+    }, [profile, workspaceLoading, currentWorkspace.id, fetchPageData]);
+
+    useEffect(() => {
+        if (refreshTrigger > 0 && currentWorkspace.id && profile && !workspaceLoading) {
+            fetchPageData(true);
+        }
+    }, [refreshTrigger, profile, workspaceLoading, currentWorkspace.id, fetchPageData]);
+
 
     // Goal Management
     const handleAddGoal = async (goalData: Omit<Goal, 'id' | 'created_at' | 'user_id' | 'workspace_id' | 'current_amount' | 'status'>) => {
@@ -82,7 +120,7 @@ const FinancialGoalsPage = () => {
         
         const { error } = await supabase.from('goals').insert([goalDataToInsert] as any);
         if (error) throw new Error(error.message);
-        await fetchPageData();
+        await fetchPageData(true);
         setIsGoalModalOpen(false);
     };
 
@@ -98,7 +136,7 @@ const FinancialGoalsPage = () => {
             p_icon_name: goalData.icon_name
         });
         if (error) throw new Error(error.message);
-        await fetchPageData();
+        await fetchPageData(true);
         setIsGoalModalOpen(false);
         setGoalToEdit(null);
     };
@@ -115,7 +153,7 @@ const FinancialGoalsPage = () => {
         try {
             const { error } = await supabase.rpc('delete_goal', { p_goal_id: goalToDeleteId });
             if (error) throw error;
-            await fetchPageData();
+            await fetchPageData(true);
         } catch(err) {
             setDeleteError(`Failed to delete goal: ${(err as Error).message}`);
         } finally {
@@ -150,7 +188,7 @@ const FinancialGoalsPage = () => {
         try {
             const { error } = await supabase.rpc('delete_goal_payment', { p_payment_id: paymentToDeleteId });
             if(error) throw error;
-            await fetchPageData();
+            await fetchPageData(true);
         } catch(err) {
             setDeleteError(`Failed to delete payment: ${(err as Error).message}`);
         } finally {
@@ -185,7 +223,7 @@ const FinancialGoalsPage = () => {
             });
             if (error) throw new Error(error.message);
         }
-        await fetchPageData(); // Fetch fresh data to ensure UI is consistent
+        await fetchPageData(true); // Fetch fresh data to ensure UI is consistent
         setIsPaymentModalOpen(false);
         setGoalForPayment(null);
         setPaymentToEdit(null);

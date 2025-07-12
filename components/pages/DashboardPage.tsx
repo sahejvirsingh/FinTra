@@ -1,8 +1,5 @@
 
-
-
-
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useMemo } from 'react';
 import { Loader2, Upload } from 'lucide-react';
 import Accounts from '../Accounts';
 import RecentExpenses from '../RecentExpenses';
@@ -13,16 +10,19 @@ import AddAccountModal from '../modals/AddAccountModal';
 import AddTopUpModal from '../modals/AddTopUpModal';
 import ConfirmationModal from '../modals/ConfirmationModal';
 import ExpenseDetailModal from '../modals/ExpenseDetailModal';
-import { Expense, Account, Goal, TopUp, RecurringIncome, Page, CategoryBudget } from '../../types';
+import ItemDetailModal from '../modals/ItemDetailModal';
+import { Expense, Account, Goal, TopUp, RecurringIncome, Page, PredictedBudget, AggregatedItem, ExpenseItem } from '../../types';
 import { supabase } from '../../lib/supabaseClient';
 import { useUser } from '../../contexts/UserContext';
 import { useWorkspace } from '../../contexts/WorkspaceContext';
 import { Database } from '../../lib/database.types';
 import WarningBanner from '../shared/WarningBanner';
 import BudgetOverview from '../dashboard/BudgetOverview';
+import StatCard from '../dashboard/StatCard';
 
-const DashboardPage = ({ onNavigate }: {
+const DashboardPage = ({ onNavigate, refreshTrigger }: {
   onNavigate: (page: Page) => void;
+  refreshTrigger: number;
 }) => {
   const [isExpenseModalOpen, setIsExpenseModalOpen] = useState(false);
   const [isAccountModalOpen, setIsAccountModalOpen] = useState(false);
@@ -38,13 +38,14 @@ const DashboardPage = ({ onNavigate }: {
   
   const [editingExpense, setEditingExpense] = useState<Expense | null>(null);
   const [viewingExpense, setViewingExpense] = useState<Expense | null>(null);
+  const [selectedItem, setSelectedItem] = useState<AggregatedItem | null>(null);
 
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [goals, setGoals] = useState<Goal[]>([]);
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [topups, setTopups] = useState<TopUp[]>([]);
   const [recurringIncomes, setRecurringIncomes] = useState<RecurringIncome[]>([]);
-  const [categoryBudgets, setCategoryBudgets] = useState<CategoryBudget[]>([]);
+  const [predictedBudgets, setPredictedBudgets] = useState<PredictedBudget[]>([]);
 
   // Drag and drop state
   const [isDragging, setIsDragging] = useState(false);
@@ -55,51 +56,91 @@ const DashboardPage = ({ onNavigate }: {
 
   const fetchData = useCallback(async (isRefresh: boolean = false) => {
     if (!profile || !currentWorkspace.id) return;
+
+    const cacheKey = `fintra_dashboard_data_${currentWorkspace.id}`;
     
     if (isRefresh) {
-      setIsRefreshing(true);
+        setIsRefreshing(true);
     } else {
-      setLoading(true);
+        try {
+            const cachedData = sessionStorage.getItem(cacheKey);
+            if (cachedData) {
+                const parsed = JSON.parse(cachedData);
+                setAccounts(parsed.accounts || []);
+                setGoals(parsed.goals || []);
+                setExpenses(parsed.expenses || []);
+                setTopups(parsed.topups || []);
+                setRecurringIncomes(parsed.recurringIncomes || []);
+                setPredictedBudgets(parsed.predictedBudgets || []);
+                setLoading(false);
+            } else {
+                setLoading(true);
+            }
+        } catch (e) {
+            console.error("Failed to load dashboard cache", e);
+            sessionStorage.removeItem(cacheKey);
+            setLoading(true);
+        }
     }
+    
     setError(null);
     setDeleteError(null);
     
     try {
-      const now = new Date();
+      const accountsPromise = supabase.rpc('get_accounts_for_workspace', { p_workspace_id: currentWorkspace.id });
+      const goalsPromise = supabase.from('goals').select('*, goal_payments(*)').eq('workspace_id', currentWorkspace.id).order('created_at', { ascending: false });
+      const expensesPromise = supabase.from('expenses').select('*, expense_items(*)').eq('workspace_id', currentWorkspace.id).order('date', { ascending: false, nullsFirst: false }).order('created_at', { ascending: false });
+      const topupsPromise = supabase.from('topups').select('*').eq('workspace_id', currentWorkspace.id);
+      const recurringIncomesPromise = supabase.from('recurring_incomes').select('*').eq('workspace_id', currentWorkspace.id);
+      const predictedBudgetsPromise = supabase.rpc('get_predicted_spending', { p_workspace_id: currentWorkspace.id });
 
-      const { data: accountsData, error: accountsError } = await supabase.rpc('get_accounts_for_workspace', { p_workspace_id: currentWorkspace.id });
-      if (accountsError) throw new Error(`Accounts: ${accountsError.message}`);
-      setAccounts((accountsData as Account[]) || []);
+      const [
+        accountsResult,
+        goalsResult,
+        expensesResult,
+        topupsResult,
+        recurringIncomesResult,
+        predictedBudgetsResult
+      ] = await Promise.all([
+          accountsPromise,
+          goalsPromise,
+          expensesPromise,
+          topupsPromise,
+          recurringIncomesPromise,
+          predictedBudgetsPromise
+      ]);
+      
+      if (accountsResult.error) throw new Error(`Accounts: ${accountsResult.error.message}`);
+      if (goalsResult.error) throw new Error(`Goals: ${goalsResult.error.message}`);
+      if (expensesResult.error) throw new Error(`Expenses: ${expensesResult.error.message}`);
+      if (topupsResult.error) throw new Error(`Topups: ${topupsResult.error.message}`);
+      if (recurringIncomesResult.error) throw new Error(`Recurring Incomes: ${recurringIncomesResult.error.message}`);
+      if (predictedBudgetsResult.error) throw new Error(`Predicted Budgets: ${predictedBudgetsResult.error.message}`);
 
-      const { data: goalsData, error: goalsError } = await supabase.from('goals').select('*, goal_payments(*)').eq('workspace_id', currentWorkspace.id).order('created_at', { ascending: false });
-      if (goalsError) throw new Error(`Goals: ${goalsError.message}`);
-      setGoals((goalsData as Goal[]) || []);
-
-      const { data: expensesData, error: expensesError } = await supabase.from('expenses').select('*, expense_items(*)').eq('workspace_id', currentWorkspace.id).order('date', { ascending: false, nullsFirst: false }).order('created_at', { ascending: false });
-      if (expensesError) throw new Error(`Expenses: ${expensesError.message}`);
-      setExpenses((expensesData as Expense[]) || []);
-
-      const { data: topupsData, error: topupsError } = await supabase.from('topups').select('*').eq('workspace_id', currentWorkspace.id);
-      if (topupsError) throw new Error(`Topups: ${topupsError.message}`);
-      setTopups(topupsData || []);
-
-      const { data: recurringIncomesData, error: recurringIncomesError } = await supabase.from('recurring_incomes').select('*').eq('workspace_id', currentWorkspace.id);
-      if (recurringIncomesError) throw new Error(`Recurring Incomes: ${recurringIncomesError.message}`);
-      setRecurringIncomes(recurringIncomesData || []);
-
-      const { data: budgetData, error: budgetError } = await supabase.from('category_budgets').select('*').eq('workspace_id', currentWorkspace.id).eq('year', now.getFullYear()).eq('month', now.getMonth() + 1);
-      if (budgetError) throw new Error(`Budget: ${budgetError.message}`);
-      setCategoryBudgets(budgetData || []);
+      const freshData = {
+          accounts: (accountsResult.data as unknown as Account[]) || [],
+          goals: (goalsResult.data as unknown as Goal[]) || [],
+          expenses: (expensesResult.data as unknown as Expense[]) || [],
+          topups: (topupsResult.data as unknown as TopUp[]) || [],
+          recurringIncomes: (recurringIncomesResult.data as unknown as RecurringIncome[]) || [],
+          predictedBudgets: (predictedBudgetsResult.data as unknown as PredictedBudget[]) || [],
+      };
+      
+      setAccounts(freshData.accounts);
+      setGoals(freshData.goals);
+      setExpenses(freshData.expenses);
+      setTopups(freshData.topups);
+      setRecurringIncomes(freshData.recurringIncomes);
+      setPredictedBudgets(freshData.predictedBudgets);
+      
+      sessionStorage.setItem(cacheKey, JSON.stringify(freshData));
 
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An unknown error occurred.');
       console.error(err);
     } finally {
-      if (isRefresh) {
-        setIsRefreshing(false);
-      } else {
-        setLoading(false);
-      }
+      setLoading(false);
+      setIsRefreshing(false);
     }
   }, [profile, currentWorkspace.id]);
 
@@ -115,7 +156,7 @@ const DashboardPage = ({ onNavigate }: {
         user_id: profile.id
     };
     
-    const { error } = await supabase.from('accounts').insert([accountToInsert] as any);
+    const { error } = await supabase.from('accounts').insert(accountToInsert);
 
     if (error) throw new Error(error.message);
     
@@ -123,11 +164,19 @@ const DashboardPage = ({ onNavigate }: {
     setIsAccountModalOpen(false);
   }, [profile, fetchData, currentWorkspace.id]);
 
+  // Initial load
   useEffect(() => {
-    if (profile && !workspaceLoading && currentWorkspace.id) {
-        fetchData();
-    }
+      if (profile && !workspaceLoading && currentWorkspace.id) {
+          fetchData(false);
+      }
   }, [profile, workspaceLoading, currentWorkspace.id, fetchData]);
+
+  // Manual refresh
+  useEffect(() => {
+      if (refreshTrigger > 0 && profile && !workspaceLoading && currentWorkspace.id) {
+          fetchData(true);
+      }
+  }, [refreshTrigger, profile, workspaceLoading, currentWorkspace.id, fetchData]);
   
   const closeExpenseModal = useCallback(() => {
     setEditingExpense(null);
@@ -150,6 +199,43 @@ const DashboardPage = ({ onNavigate }: {
     setIsConfirmModalOpen(true);
   }, []);
 
+  const aggregatedItems = useMemo((): AggregatedItem[] => {
+    const itemsMap = new Map<string, AggregatedItem>();
+    expenses.forEach(expense => {
+        if (expense.expense_items) {
+            expense.expense_items.forEach(item => {
+                const itemName = item.name.trim().toLowerCase();
+                if (!itemName) return;
+                
+                const existing = itemsMap.get(itemName);
+                const itemCost = item.price * item.quantity;
+
+                if (existing) {
+                    existing.totalQuantity += item.quantity;
+                    existing.totalSpent += itemCost;
+                    existing.occurrences.push({ ...item, expenseTitle: expense.title, expenseDate: expense.date, expenseId: expense.id });
+                } else {
+                    itemsMap.set(itemName, {
+                        name: item.name,
+                        totalQuantity: item.quantity,
+                        totalSpent: itemCost,
+                        occurrences: [{ ...item, expenseTitle: expense.title, expenseDate: expense.date, expenseId: expense.id }]
+                    });
+                }
+            });
+        }
+    });
+    return Array.from(itemsMap.values());
+  }, [expenses]);
+  
+  const handleViewItemHistory = useCallback((item: ExpenseItem) => {
+    const itemToView = aggregatedItems.find(agg => agg.name.toLowerCase() === item.name.toLowerCase());
+    if (itemToView) {
+        setViewingExpense(null); // Close the expense detail modal
+        setSelectedItem(itemToView); // Open the item detail modal
+    }
+  }, [aggregatedItems]);
+
   const addExpense = useCallback(async (newExpenseData: NewExpenseData) => {
     if(!profile || !currentWorkspace.id) throw new Error("User or workspace not found");
     const { items, ...expenseDetails } = newExpenseData;
@@ -164,7 +250,7 @@ const DashboardPage = ({ onNavigate }: {
         p_date: expenseDetails.date,
         p_time: expenseDetails.time || null,
         p_description: expenseDetails.description,
-        p_items: rpcItems,
+        p_items: rpcItems as any,
         p_workspace_id: currentWorkspace.id
     });
     
@@ -190,7 +276,7 @@ const DashboardPage = ({ onNavigate }: {
         p_new_date: expenseDetails.date,
         p_new_time: expenseDetails.time || null,
         p_new_description: expenseDetails.description,
-        p_new_items: rpcItems,
+        p_new_items: rpcItems as any,
     });
 
     if (error) {
@@ -286,6 +372,22 @@ const DashboardPage = ({ onNavigate }: {
     }
   }, [openAddExpenseModal]);
 
+  const { totalIncome, totalExpenses, netFlow } = useMemo(() => {
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    
+    const income = topups.filter(t => new Date(t.topup_time) >= startOfMonth).reduce((sum, t) => sum + t.amount, 0) +
+                   recurringIncomes.filter(ri => ri.is_active).reduce((sum, ri) => sum + ri.amount, 0);
+                   
+    const expense = expenses.filter(e => new Date(e.date) >= startOfMonth).reduce((sum, e) => sum + e.amount, 0);
+
+    return {
+      totalIncome: income,
+      totalExpenses: expense,
+      netFlow: income - expense,
+    }
+  }, [expenses, topups, recurringIncomes]);
+
 
   if (error) {
     return (
@@ -299,7 +401,7 @@ const DashboardPage = ({ onNavigate }: {
     );
   }
   
-  if (loading || workspaceLoading || !profile) {
+  if (loading) {
       return (
           <div className="flex items-center justify-center h-full">
             <Loader2 size={48} className="animate-spin text-indigo-500" />
@@ -335,47 +437,46 @@ const DashboardPage = ({ onNavigate }: {
         </div>
       )}
 
-      <div className={`grid grid-cols-1 lg:grid-cols-3 gap-8 transition-opacity duration-300 ${isDragging ? 'opacity-50 blur-sm' : 'opacity-100'}`}>
-        <div className="lg:col-span-2">
-          <Accounts 
-            accounts={accounts} 
-            expenses={expenses}
-            topups={topups}
-            recurringIncomes={recurringIncomes}
-            categoryBudgets={categoryBudgets}
-            onAddAccountClick={openAccountModal}
-            onTopUpClick={openTopUpModal}
-            onRefreshClick={() => fetchData(true)}
-            isRefreshing={isRefreshing}
-            currency={profile.currency} />
+      <div className={`space-y-8 transition-opacity duration-300 ${isDragging ? 'opacity-50 blur-sm' : 'opacity-100'}`}>
+         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <StatCard title="Total Income" value={totalIncome} currency={profile.currency} colorClass="text-green-500" period="this month" />
+            <StatCard title="Total Expenses" value={totalExpenses} currency={profile.currency} colorClass="text-red-500" period="this month" />
+            <StatCard title="Net Flow" value={netFlow} currency={profile.currency} colorClass={netFlow >= 0 ? 'text-blue-500' : 'text-orange-500'} period="this month" />
         </div>
-        <div className="lg:col-span-1">
-          <RecentExpenses 
-             onAddExpenseClick={openAddExpenseModal} 
-             expenses={expenses} 
-             currency={profile.currency}
-             onViewAllClick={() => onNavigate('transactions')}
-             onViewExpense={setViewingExpense}
-             />
+        
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+            <div className="lg:col-span-1">
+                <Accounts 
+                    accounts={accounts}
+                    onAddAccountClick={openAccountModal}
+                    onTopUpClick={openTopUpModal}
+                    onRefreshClick={() => fetchData(true)}
+                    isRefreshing={isRefreshing}
+                    currency={profile.currency} />
+            </div>
+            <div className="lg:col-span-2">
+                <RecentExpenses 
+                onAddExpenseClick={openAddExpenseModal} 
+                expenses={expenses} 
+                currency={profile.currency}
+                onViewAllClick={() => onNavigate('transactions')}
+                onViewExpense={setViewingExpense}
+                />
+            </div>
         </div>
-         <div className="lg:col-span-3">
-          <BudgetOverview 
+
+         <BudgetOverview 
             expenses={expenses} 
-            categoryBudgets={categoryBudgets} 
+            predictedBudgets={predictedBudgets} 
             currency={profile.currency} 
             onNavigate={() => onNavigate('budgeting')} 
           />
-        </div>
-        <div className="lg:col-span-3">
           <FinancialGoals 
             goals={goals} 
             currency={profile.currency} 
             onNavigate={() => onNavigate('financial_goals')}
           />
-        </div>
-        <div className="lg:col-span-3">
-          <SpendingAnalytics expenses={expenses} currency={profile.currency} />
-        </div>
+        <SpendingAnalytics expenses={expenses} currency={profile.currency} />
       </div>
       {isExpenseModalOpen && (
         <AddExpenseModal 
@@ -409,6 +510,14 @@ const DashboardPage = ({ onNavigate }: {
           onClose={() => setViewingExpense(null)}
           onEdit={handleEditExpense}
           onDelete={handleDeleteExpense}
+          onViewItemHistory={handleViewItemHistory}
+        />
+      )}
+      {selectedItem && (
+        <ItemDetailModal
+            item={selectedItem}
+            currency={profile.currency}
+            onClose={() => setSelectedItem(null)}
         />
       )}
     </div>

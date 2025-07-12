@@ -1,9 +1,4 @@
 
-
-
-
-
-
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Loader2, Share2, Save, Users, User, Lock, Trash2, SlidersHorizontal, CheckCircle } from 'lucide-react';
 import { useTheme } from '../../hooks/useTheme';
@@ -28,13 +23,19 @@ const SaveButton = ({ onSave, isSaving, disabled }: {
   );
 }
 
-const WorkspaceManager = () => {
-    const { workspaces, deleteWorkspace, currentWorkspace, currentUserRole } = useWorkspace();
+const WorkspaceManager = ({ refreshTrigger }: { refreshTrigger: number }) => {
+    const { workspaces, deleteWorkspace, currentWorkspace, currentUserRole, fetchWorkspaces } = useWorkspace();
     const { profile } = useUser();
     const [isConfirmOpen, setIsConfirmOpen] = useState(false);
     const [workspaceToDelete, setWorkspaceToDelete] = useState<Workspace | null>(null);
     const [isDeleting, setIsDeleting] = useState(false);
     const [deleteError, setDeleteError] = useState('');
+
+    useEffect(() => {
+        if (refreshTrigger > 0) {
+            fetchWorkspaces();
+        }
+    }, [refreshTrigger, fetchWorkspaces]);
 
     const personalWorkspacesCount = workspaces.filter(w => w.type === 'personal').length;
 
@@ -124,7 +125,7 @@ const WorkspaceManager = () => {
 };
 
 
-const AccountSharingManager = () => {
+const AccountSharingManager = ({ refreshTrigger }: { refreshTrigger: number }) => {
     const { workspaces } = useWorkspace();
     const { profile } = useUser();
     const [allPersonalAccounts, setAllPersonalAccounts] = useState<(Account & { workspace_name: string })[]>([]);
@@ -154,7 +155,7 @@ const AccountSharingManager = () => {
             
             if (error) throw error;
 
-            const sharedIds = new Set((data as any[])?.map(d => d.workspace_id) || []);
+            const sharedIds = new Set((data as { workspace_id: string }[] | null)?.map(d => d.workspace_id) || []);
             setSharedWith(sharedIds);
         } catch (err) {
             console.error("Error fetching shared status:", err);
@@ -165,41 +166,42 @@ const AccountSharingManager = () => {
         }
     }, []);
 
-    useEffect(() => {
-        const fetchOwnedAccounts = async () => {
-            if (!profile || workspaces.length === 0) {
-                setIsLoading(false);
-                return;
-            }
-            
-            const personalWorkspaceIds = workspaces.filter(w => w.type === 'personal').map(w => w.id);
-            if (personalWorkspaceIds.length === 0) {
-                setAllPersonalAccounts([]);
-                setIsLoading(false);
-                return;
-            }
+    const fetchOwnedAccounts = useCallback(async () => {
+        if (!profile || workspaces.length === 0) {
+            setIsLoading(false);
+            return;
+        }
+        
+        const personalWorkspaceIds = workspaces.filter(w => w.type === 'personal').map(w => w.id);
+        if (personalWorkspaceIds.length === 0) {
+            setAllPersonalAccounts([]);
+            setIsLoading(false);
+            return;
+        }
 
-            const { data, error } = await supabase.from('accounts').select('*').in('workspace_id', personalWorkspaceIds);
-            
-            if (!error && data) {
-                 const workspaceNameMap = new Map(workspaces.map(w => [w.id, w.name]));
-                 const fetchedAccounts = (data as Account[]).map(acc => ({
-                     ...acc,
-                     workspace_name: workspaceNameMap.get(acc.workspace_id) || 'Unknown Workspace'
-                 }));
-                 setAllPersonalAccounts(fetchedAccounts);
-                 if (fetchedAccounts.length > 0 && !selectedAccount) {
-                     await handleAccountSelect(fetchedAccounts[0].id);
-                 } else {
-                     setIsLoading(false);
-                 }
-            } else {
-                setAllPersonalAccounts([]);
-                setIsLoading(false);
-            }
-        };
-        fetchOwnedAccounts();
+        const { data, error } = await supabase.from('accounts').select('*').in('workspace_id', personalWorkspaceIds);
+        
+        if (!error && data) {
+             const workspaceNameMap = new Map(workspaces.map(w => [w.id, w.name]));
+             const fetchedAccounts = data.map((acc) => ({
+                 ...acc,
+                 workspace_name: workspaceNameMap.get(acc.workspace_id) || 'Unknown Workspace'
+             }));
+             setAllPersonalAccounts(fetchedAccounts);
+             if (fetchedAccounts.length > 0 && !selectedAccount) {
+                 await handleAccountSelect(fetchedAccounts[0].id);
+             } else {
+                 setIsLoading(false);
+             }
+        } else {
+            setAllPersonalAccounts([]);
+            setIsLoading(false);
+        }
     }, [profile, workspaces, handleAccountSelect, selectedAccount]);
+
+    useEffect(() => {
+        fetchOwnedAccounts();
+    }, [fetchOwnedAccounts, refreshTrigger]);
 
 
     const handleWorkspaceToggle = async (workspaceId: string) => {
@@ -299,7 +301,7 @@ const AccountSharingManager = () => {
     );
 };
 
-const SettingsPage = () => {
+const SettingsPage = ({ refreshTrigger }: { refreshTrigger: number }) => {
   const { theme, toggleTheme } = useTheme();
   const { profile, fetchProfile } = useUser();
   
@@ -340,7 +342,7 @@ const SettingsPage = () => {
     if (!profile || !hasProfileChanges) return;
     setIsSavingProfile(true); setProfileMessage('');
     const updatePayload: Database['public']['Tables']['users']['Update'] = { full_name: fullName };
-    const { error } = await supabase.from('users').update(updatePayload as any).eq('id', profile.id);
+    const { error } = await supabase.from('users').update(updatePayload).eq('id', profile.id);
     setIsSavingProfile(false);
     if (error) { setProfileMessage('Error saving profile.'); } 
     else {
@@ -358,7 +360,7 @@ const SettingsPage = () => {
         secondary_currency: secondaryCurrency || null,
         auto_transfer_savings: autoTransfer,
     };
-    const { error } = await supabase.from('users').update(prefsUpdate as any).eq('id', profile.id);
+    const { error } = await supabase.from('users').update(prefsUpdate).eq('id', profile.id);
     setIsSavingPrefs(false);
     if(error) { setPrefsMessage('Error saving preferences.'); }
     else {
@@ -401,8 +403,8 @@ const SettingsPage = () => {
          </div>
       </div>
       
-      <WorkspaceManager />
-      <AccountSharingManager />
+      <WorkspaceManager refreshTrigger={refreshTrigger} />
+      <AccountSharingManager refreshTrigger={refreshTrigger} />
 
       <div className={cardClasses}>
         <h2 className="text-xl font-semibold text-gray-900 dark:text-white">Appearance</h2>
@@ -429,11 +431,11 @@ const SettingsPage = () => {
         <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700 space-y-6">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-center">
             <div><label className={labelClasses}>Default Currency</label><p className={descriptionClasses}>Used for all primary displays.</p></div>
-            <CustomDropdown<Currency> isSearchable options={primaryCurrencyOptions} value={selectedCurrency} onChange={(val) => setSelectedCurrency(val)} placeholder="Select primary currency" getLabel={getCurrencyLabel}/>
+            <CustomDropdown<Currency> isSearchable options={primaryCurrencyOptions} value={selectedCurrency} onChange={setSelectedCurrency} placeholder="Select primary currency" getLabel={getCurrencyLabel}/>
           </div>
            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-center">
             <div><label className={labelClasses}>Secondary Currency</label><p className={descriptionClasses}>For viewing exchange rates on the Accounts page.</p></div>
-            <CustomDropdown<Currency | ''> isSearchable options={secondaryCurrencyOptions} value={secondaryCurrency} onChange={(val) => setSecondaryCurrency(val)} placeholder="Select secondary currency" getLabel={getCurrencyLabel}/>
+            <CustomDropdown<Currency | ''> isSearchable options={secondaryCurrencyOptions} value={secondaryCurrency} onChange={setSecondaryCurrency} placeholder="Select secondary currency" getLabel={getCurrencyLabel}/>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-center">
             <div><label className={labelClasses}>Auto-transfer to Savings</label><p className={descriptionClasses}>Move leftover budget to Savings at month-end.</p></div>
